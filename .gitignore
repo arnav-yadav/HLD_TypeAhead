@@ -1,0 +1,14 @@
+node_modules/
+client/node_modules/
+client/dist/
+.env
+*.log
+.DS_Store
+CLAUDE.md
+.claude/
+
+# Python test venv + caches
+.venv-test/
+.venv/
+__pycache__/
+.pytest_cache/

@@ -1,0 +1,443 @@
+openapi: 3.0.3
+info:
+  title: Search Typeahead API
+  version: 1.0.0
+  description: >
+    Backend for a search autocomplete system: trie-based prefix suggestions, a
+    consistent-hashed Redis suggestion cache, recency-aware trending (decayed
+    ZSET), and batched writes to Postgres. Shapes below match the actual Express
+    route handlers exactly.
+servers:
+  - url: http://localhost:4000
+    description: Local dev server
+
+paths:
+  /:
+    get:
+      operationId: getRoot
+      summary: Service banner
+      description: Minimal liveness banner pointing at /health.
+      tags: [Meta]
+      responses:
+        '200':
+          description: Service info.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service:
+                    type: string
+                    example: search-typeahead
+                  see:
+                    type: string
+                    example: /health
+                required: [service, see]
+
+  /suggest:
+    get:
+      operationId: getSuggest
+      summary: Prefix suggestions
+      description: >
+        Returns up to 10 suggestions whose query starts with the (normalized,
+        lower-cased, trimmed) prefix, sorted by count descending then
+        alphabetically. An empty prefix or no match returns HTTP 200 with an
+        empty `suggestions` array — never a 404. `count` is a rounded snapshot
+        taken at cache-write time, not a guaranteed-live value.
+      tags: [Suggestions]
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: The typed prefix. Normalized server-side via toLowerCase().trim().
+          schema:
+            type: string
+          example: iph
+      responses:
+        '200':
+          description: Suggestion list (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  prefix:
+                    type: string
+                    description: The normalized prefix that was looked up.
+                    example: iph
+                  suggestions:
+                    type: array
+                    maxItems: 10
+                    items:
+                      $ref: '#/components/schemas/Suggestion'
+                required: [prefix, suggestions]
+              examples:
+                hit:
+                  summary: Known prefix
+                  value:
+                    prefix: iph
+                    suggestions:
+                      - { query: iphone, count: 100000 }
+                      - { query: iphone 15, count: 88000 }
+                empty:
+                  summary: No match
+                  value:
+                    prefix: zzqxyz
+                    suggestions: []
+
+  /search:
+    post:
+      operationId: postSearch
+      summary: Submit a search
+      description: >
+        Buffers a count increment in memory (NOT a synchronous DB write) and
+        bumps the decayed trending ZSET. A query that is empty after trimming is
+        ignored (no blank entry is created), but the response body is unchanged.
+        Always returns exactly `{ "message": "Searched" }` — no extra fields.
+      tags: [Search]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                  description: The search text. Normalized server-side via trim().toLowerCase().
+                  example: iphone
+              required: [query]
+      responses:
+        '200':
+          description: Acknowledged.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    enum: [Searched]
+                    example: Searched
+                required: [message]
+
+  /trending:
+    get:
+      operationId: getTrending
+      summary: Trending queries
+      description: >
+        Returns the top-N trending queries. In `enhanced` mode (default), items
+        come from the recency-aware decayed Redis ZSET and carry a `score`. In
+        `basic` mode, items come from the raw all-time count map and carry a
+        `count`. Any mode value other than `basic` is treated as `enhanced`.
+      tags: [Trending]
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          description: Ranking mode. Defaults to enhanced; only the literal "basic" selects basic.
+          schema:
+            type: string
+            enum: [enhanced, basic]
+            default: enhanced
+      responses:
+        '200':
+          description: Trending list for the selected mode.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/TrendingEnhanced'
+                  - $ref: '#/components/schemas/TrendingBasic'
+              examples:
+                enhanced:
+                  summary: enhanced (decayed score)
+                  value:
+                    mode: enhanced
+                    items:
+                      - { query: iphone, score: 301.03 }
+                      - { query: iphone 15, score: 264 }
+                basic:
+                  summary: basic (all-time count)
+                  value:
+                    mode: basic
+                    items:
+                      - { query: iphone, count: 100001 }
+                      - { query: iphone 15, count: 88000 }
+
+  /cache/debug:
+    get:
+      operationId: getCacheDebug
+      summary: Cache routing + ring distribution
+      description: >
+        Shows which Redis node the consistent-hash ring routes a prefix to,
+        whether that key is currently cached, and the ring's keyspace
+        distribution (fraction of the 2^32 ring each physical node owns) — proof
+        that virtual nodes balance the ring.
+      tags: [Cache]
+      parameters:
+        - name: prefix
+          in: query
+          required: false
+          description: Prefix to route. Normalized server-side via toLowerCase().trim().
+          schema:
+            type: string
+          example: iph
+      responses:
+        '200':
+          description: Routing decision plus ring distribution.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  prefix:
+                    type: string
+                    example: iph
+                  node:
+                    $ref: '#/components/schemas/RedisNode'
+                  hit:
+                    type: boolean
+                    description: Whether suggest:<prefix> currently exists on the routed node.
+                    example: true
+                  ringDistribution:
+                    type: object
+                    description: nodeId -> fraction of the keyspace owned (0..1).
+                    additionalProperties:
+                      type: number
+                      format: float
+                    example:
+                      node0: 0.316
+                      node1: 0.3145
+                      node2: 0.3695
+                  virtualNodesPerNode:
+                    type: integer
+                    example: 150
+                required: [prefix, node, hit, ringDistribution, virtualNodesPerNode]
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness
+      description: >
+        Reports Redis node and Postgres reachability. Returns 200 with
+        status "ok" when Postgres is up and at least one Redis node responds;
+        otherwise 503 with status "degraded".
+      tags: [Meta]
+      responses:
+        '200':
+          description: Healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                redis:
+                  - { id: node0, host: localhost, port: 6379, ok: true }
+                  - { id: node1, host: localhost, port: 6380, ok: true }
+                  - { id: node2, host: localhost, port: 6381, ok: true }
+                postgres: true
+        '503':
+          description: Degraded (Postgres down or all Redis nodes unreachable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: degraded
+                redis:
+                  - { id: node0, host: localhost, port: 6379, ok: false }
+                postgres: false
+
+  /stats:
+    get:
+      operationId: getStats
+      summary: Instrumentation snapshot
+      description: >
+        All in-process metrics in one payload: rolling /suggest latency
+        percentiles, cache hit/miss counters, DB read/write counters, total
+        searches, batch-buffer state, and trie size. The headline is that
+        `db.writes` is far below `searchCount` (batching reduces write pressure).
+      tags: [Meta]
+      responses:
+        '200':
+          description: Metrics snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+              example:
+                latencyMs: { p50: 0.83, p95: 2.52, p99: 106.28, samples: 1000 }
+                cache: { hits: 976, misses: 26, hitRate: 0.9741 }
+                db: { reads: 0, writes: 1 }
+                searchCount: 2001
+                buffer: { pendingIncrements: 0, pendingEntries: 0, totalFlushes: 1 }
+                trieSize: 102688
+
+components:
+  schemas:
+    Suggestion:
+      type: object
+      properties:
+        query:
+          type: string
+          example: iphone
+        count:
+          type: integer
+          description: Rounded count snapshot at cache-write time.
+          example: 100000
+      required: [query, count]
+
+    TrendingEnhanced:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [enhanced]
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              query:
+                type: string
+                example: iphone
+              score:
+                type: number
+                format: float
+                description: Decayed trending score (recency-aware).
+                example: 301.03
+            required: [query, score]
+      required: [mode, items]
+
+    TrendingBasic:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [basic]
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              query:
+                type: string
+                example: iphone
+              count:
+                type: integer
+                description: Raw all-time count.
+                example: 100001
+            required: [query, count]
+      required: [mode, items]
+
+    RedisNode:
+      type: object
+      properties:
+        id:
+          type: string
+          example: node1
+        host:
+          type: string
+          example: localhost
+        port:
+          type: integer
+          example: 6380
+      required: [id, host, port]
+
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        redis:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/RedisNode'
+              - type: object
+                properties:
+                  ok:
+                    type: boolean
+                    description: Whether this node responded to PING.
+                    example: true
+                required: [ok]
+        postgres:
+          type: boolean
+      required: [status, redis, postgres]
+
+    Stats:
+      type: object
+      properties:
+        latencyMs:
+          type: object
+          description: Rolling /suggest latency percentiles (ms).
+          properties:
+            p50:
+              type: number
+              format: float
+            p95:
+              type: number
+              format: float
+            p99:
+              type: number
+              format: float
+            samples:
+              type: integer
+              description: Number of latency samples in the rolling window.
+          required: [p50, p95, p99, samples]
+        cache:
+          type: object
+          properties:
+            hits:
+              type: integer
+            misses:
+              type: integer
+            hitRate:
+              type: number
+              format: float
+              description: hits / (hits + misses); 0 when no requests yet.
+          required: [hits, misses, hitRate]
+        db:
+          type: object
+          properties:
+            reads:
+              type: integer
+            writes:
+              type: integer
+              description: Batched upsert count — far below searchCount when batching works.
+          required: [reads, writes]
+        searchCount:
+          type: integer
+          description: Total POST /search requests accepted.
+        buffer:
+          type: object
+          properties:
+            pendingIncrements:
+              type: integer
+              description: Total +N increments currently buffered (sum across entries).
+            pendingEntries:
+              type: integer
+              description: Distinct queries currently buffered.
+            totalFlushes:
+              type: integer
+              description: Number of successful DB write batches so far.
+          required: [pendingIncrements, pendingEntries, totalFlushes]
+        trieSize:
+          type: integer
+          description: Distinct queries indexed in the in-memory trie.
+      required: [latencyMs, cache, db, searchCount, buffer, trieSize]
+
+tags:
+  - name: Suggestions
+    description: Prefix autocomplete.
+  - name: Search
+    description: Search submission (buffered + trending).
+  - name: Trending
+    description: Recency-aware and all-time trending lists.
+  - name: Cache
+    description: Consistent-hash routing introspection.
+  - name: Meta
+    description: Liveness, metrics, and service banner.

@@ -1,0 +1,47 @@
+# Runs the data infra for the typeahead system locally with one command.
+#
+# Three SEPARATE Redis instances (not one) so we can genuinely demonstrate
+# consistent-hashing routing/partitioning across nodes — see docs/architecture.md.
+# Honest framing: 3 Redis on one machine prove ROUTING + PARTITIONING, not
+# throughput scaling (still one box, one CPU).
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: typeahead-postgres
+    environment:
+      POSTGRES_DB: typeahead
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d typeahead"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis0:
+    image: redis:7-alpine
+    container_name: typeahead-redis0
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  redis1:
+    image: redis:7-alpine
+    container_name: typeahead-redis1
+    ports:
+      - "6380:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  redis2:
+    image: redis:7-alpine
+    container_name: typeahead-redis2
+    ports:
+      - "6381:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+volumes:
+  pgdata:

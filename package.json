@@ -1,0 +1,27 @@
+{
+  "name": "search-typeahead-server",
+  "version": "1.0.0",
+  "description": "Search typeahead (autocomplete) backend — trie suggestions, consistent-hashed Redis cache, decayed trending, batched writes.",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "seed": "node server/db/seed.js",
+    "loadtest": "node scripts/loadtest.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "pg": "^8.12.0",
+    "pg-copy-streams": "^6.0.6",
+    "swagger-ui-express": "^5.0.1",
+    "yamljs": "^0.3.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.9"
+  }
+}
